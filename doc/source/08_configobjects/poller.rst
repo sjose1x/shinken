@@ -72,7 +72,7 @@ address
   This directive is used to define the address from where the main arbiter can reach this poller. This can be a DNS name or a IP address.
 
 port
-  This directive is used to define the TCP port used bu the daemon. The default value is *7771*.
+  This directive is used to define the TCP port used by the daemon. The default value is *7771*.
 
 spare
   This variable is used to define if the poller must be managed as a spare one (will take the conf only if a master failed). The default value is *0* (master).
