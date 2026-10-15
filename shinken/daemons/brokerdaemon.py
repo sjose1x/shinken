@@ -22,6 +22,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with Shinken.  If not, see <http://www.gnu.org/licenses/>.
 
+import gc
 import os
 import sys
 import time
@@ -30,18 +31,26 @@ import cPickle
 import base64
 import zlib
 import threading
-import copy
+import ctypes
 from multiprocessing import active_children
-from collections import deque
 
 from shinken.satellite import BaseSatellite
 from shinken.property import PathProp, IntegerProp
-from shinken.util import sort_by_ids, get_memory, parse_memory_expr, free_memory
+from shinken.util import sort_by_ids, get_memory
 from shinken.log import logger
 from shinken.stats import statsmgr
 from shinken.external_command import ExternalCommand
 from shinken.http_client import HTTPClient, HTTPExceptions
 from shinken.daemon import Daemon, Interface
+
+# Load libc for malloc_trim to force glibc to return freed heap to OS
+_libc = ctypes.CDLL("libc.so.6")
+
+def _malloc_trim():
+    """Force glibc to return freed heap pages to the OS."""
+    _libc.malloc_trim(0)
+
+
 
 
 class IStats(Interface):
@@ -50,8 +59,6 @@ class IStats(Interface):
     """
 
     doc = 'Get raw stats from the daemon'
-
-
     def get_raw_stats(self):
         app = self.app
         res = []
@@ -64,20 +71,18 @@ class IStats(Interface):
                 res.append({'module_name': inst.get_name(), 'queue_size': 0})
 
         return res
-
-
     get_raw_stats.doc = doc
 
 
 # Our main APP class
 class Broker(BaseSatellite):
+
     properties = BaseSatellite.properties.copy()
     properties.update({
         'pidfile':   PathProp(default='brokerd.pid'),
         'port':      IntegerProp(default=7772),
         'local_log': PathProp(default='brokerd.log'),
     })
-
 
     def __init__(self, config_file, is_daemon, do_replace, debug, debug_file, profile=''):
 
@@ -100,9 +105,7 @@ class Broker(BaseSatellite):
         self.external_commands = []
 
         # All broks to manage
-        self.broks = deque()  # broks to manage
-        self.external_module_broks = deque()  # broks during this loop to send to external modules
-        self.broks_lock = threading.RLock()  # to manage lock when managing broks
+        self.broks = []  # broks to manage
         # broks raised this turn and that needs to be put in self.broks
         self.broks_internal_raised = []
         # broks raised by the arbiters, we need a lock so the push can be in parallel
@@ -111,6 +114,10 @@ class Broker(BaseSatellite):
         self.arbiter_broks_lock = threading.RLock()
 
         self.timeout = 1.0
+
+        # Periodic GC to reclaim circular-ref memory from unpickled broks
+        self._gc_interval = 60  # seconds between forced collections
+        self._last_gc = time.time()
 
         self.istats = IStats(self)
 
@@ -165,15 +172,16 @@ class Broker(BaseSatellite):
 
     # Get the good tabs for links by the kind. If unknown, return None
     def get_links_from_type(self, d_type):
-        t = {'scheduler':   self.schedulers,
-             'arbiter':     self.arbiters,
-             'poller':      self.pollers,
+        t = {'scheduler': self.schedulers,
+             'arbiter': self.arbiters,
+             'poller': self.pollers,
              'reactionner': self.reactionners,
-             'receiver':    self.receivers
+             'receiver': self.receivers
              }
         if d_type in t:
             return t[d_type]
         return None
+
 
 
     # Check if we do not connect to often to this
@@ -239,6 +247,7 @@ class Broker(BaseSatellite):
             links[id]['con'] = None
             return
 
+
         try:
             # initial ping must be quick
             con.get('ping')
@@ -251,7 +260,7 @@ class Broker(BaseSatellite):
             if new_run_id != running_id:
                 logger.debug("[%s] New running id for the %s %s: %s (was %s)",
                              self.name, type, links[id]['name'], new_run_id, running_id)
-                del links[id]['broks'][:]
+                links[id]['broks'].clear()
                 # we must ask for a new full broks if
                 # it's a scheduler
                 if type == 'scheduler':
@@ -293,12 +302,9 @@ class Broker(BaseSatellite):
     # Add broks (a tab) to different queues for
     # internal and external modules
     def add_broks_to_queue(self, broks):
-        statsmgr.incr('core.broker.broks.in', len(broks), 'queue')
         # Ok now put in queue broks to be managed by
         # internal modules
-        with self.broks_lock:
-            self.broks.extend(broks)
-            self.external_module_broks.extend(broks)
+        self.broks.extend(broks)
 
 
     # Each turn we get all broks from
@@ -336,24 +342,25 @@ class Broker(BaseSatellite):
                     t0 = time.time()
                     # Before ask a call that can be long, do a simple ping to be sure it is alive
                     con.get('ping')
-                    tmp_broks = con.get(
-                        'get_broks',
-                        {'bname': self.name, 'broks_batch': self.broks_batch},
-                        wait='long')
+                    tmp_broks = con.get('get_broks', {'bname': self.name}, wait='long')
                     try:
                         _t = base64.b64decode(tmp_broks)
                         _t = zlib.decompress(_t)
                         tmp_broks = cPickle.loads(_t)
+                        del _t  # Free large decompressed buffer immediately
                     except (TypeError, zlib.error, cPickle.PickleError), exp:
                         logger.error('Cannot load broks data from %s : %s',
                                      links[sched_id]['name'], exp)
                         links[sched_id]['con'] = None
                         continue
                     logger.debug("%s Broks get in %s", len(tmp_broks), time.time() - t0)
-                    for b in tmp_broks:
+                    broks_list = tmp_broks.values()
+                    for b in broks_list:
                         b.instance_id = links[sched_id]['instance_id']
                     # Ok, we can add theses broks to our queues
-                    self.add_broks_to_queue(tmp_broks)
+                    self.add_broks_to_queue(broks_list)
+                    del tmp_broks, broks_list  # Free unpickled dict promptly
+
                 else:  # no con? make the connection
                     self.pynag_con_init(sched_id, type=type)
             # Ok, con is not known, so we create it
@@ -397,6 +404,7 @@ class Broker(BaseSatellite):
 
     def setup_new_conf(self):
         conf = self.new_conf
+        self.new_conf = None
         self.cur_conf = conf
         # Got our name from the globals
         g_conf = conf['global']
@@ -405,22 +413,17 @@ class Broker(BaseSatellite):
         else:
             name = 'Unnamed broker'
         self.name = name
-        props_to_get = ['broks_batch', 'api_key', 'secret', 'http_proxy',
-                        'statsd_host', 'statsd_port', 'statsd_prefix',
-                        'statsd_enabled', 'statsd_interval', 'statsd_types',
-                        'statsd_pattern']
-        for prop in props_to_get:
-            v = g_conf[prop]
-            setattr(self, prop, v)
-        self.harakiri_threshold = parse_memory_expr(g_conf['harakiri_threshold'])
+        self.api_key = g_conf['api_key']
+        self.secret = g_conf['secret']
+        self.http_proxy = g_conf['http_proxy']
+        self.statsd_host = g_conf['statsd_host']
+        self.statsd_port = g_conf['statsd_port']
+        self.statsd_prefix = g_conf['statsd_prefix']
+        self.statsd_enabled = g_conf['statsd_enabled']
+        self.statsd_interval = g_conf['statsd_interval']
+        self.statsd_types = g_conf['statsd_types']
+        self.statsd_pattern = g_conf['statsd_pattern']
 
-        if self.harakiri_threshold is not None:
-            self.raw_conf = self.new_conf
-        else:
-            self.raw_conf = None
-        self.new_conf = None
-        if self.aggressive_memory_management:
-            free_memory()
         # We got a name so we can update the logger and the stats global objects
         logger.load_obj(self, name)
         statsmgr.register(self, name, 'broker',
@@ -457,7 +460,7 @@ class Broker(BaseSatellite):
                 broks = self.schedulers[sched_id]['broks']
                 running_id = self.schedulers[sched_id]['running_id']
             else:
-                broks = []
+                broks = {}
                 running_id = 0
             s = conf['schedulers'][sched_id]
             self.schedulers[sched_id] = s
@@ -489,7 +492,7 @@ class Broker(BaseSatellite):
             if already_got:
                 broks = self.arbiters[arb_id]['broks']
             else:
-                broks = []
+                broks = {}
             a = conf['arbiters'][arb_id]
             self.arbiters[arb_id] = a
 
@@ -521,7 +524,7 @@ class Broker(BaseSatellite):
                 broks = self.pollers[pol_id]['broks']
                 running_id = self.schedulers[sched_id]['running_id']
             else:
-                broks = []
+                broks = {}
                 running_id = 0
             p = conf['pollers'][pol_id]
             self.pollers[pol_id] = p
@@ -543,6 +546,9 @@ class Broker(BaseSatellite):
             self.pollers[pol_id]['running_id'] = running_id
             self.pollers[pol_id]['last_connection'] = 0
 
+#                    #And we connect to it
+#                    self.app.pynag_con_init(pol_id, 'poller')
+
         logger.info("We have our pollers: %s", self.pollers)
 
         # Now reactionners
@@ -553,7 +559,7 @@ class Broker(BaseSatellite):
                 broks = self.reactionners[rea_id]['broks']
                 running_id = self.schedulers[sched_id]['running_id']
             else:
-                broks = []
+                broks = {}
                 running_id = 0
 
             r = conf['reactionners'][rea_id]
@@ -575,6 +581,9 @@ class Broker(BaseSatellite):
             self.reactionners[rea_id]['running_id'] = running_id
             self.reactionners[rea_id]['last_connection'] = 0
 
+#                    #And we connect to it
+#                    self.app.pynag_con_init(rea_id, 'reactionner')
+
         logger.info("We have our reactionners: %s", self.reactionners)
 
         # Now receivers
@@ -585,7 +594,7 @@ class Broker(BaseSatellite):
                 broks = self.receivers[rec_id]['broks']
                 running_id = self.schedulers[sched_id]['running_id']
             else:
-                broks = []
+                broks = {}
                 running_id = 0
 
             r = conf['receivers'][rec_id]
@@ -617,6 +626,8 @@ class Broker(BaseSatellite):
             self.modules_manager.set_modules(self.modules)
             self.do_load_modules()
             self.modules_manager.start_external_instances()
+
+
 
         # Set our giving timezone from arbiter
         use_timezone = conf['global']['use_timezone']
@@ -681,29 +692,15 @@ class Broker(BaseSatellite):
 
 
     def do_loop_turn(self):
-        loop_time = time.time()
-        with self.broks_lock:
-            nb_broks = len(self.broks)
-            nb_external_broks = len(self.external_module_broks)
-        logger.debug("[Broks] Begin Loop: managing queue broks [%d]" % nb_broks)
-
-        self.broks_done = 0
-        # FIXME: Does it come from a structure only known from enterprise ?
-        # for mod in self.modules_manager.get_internal_instances():
-        #     self.local_module_stats[mod.get_name()] = 0
+        logger.debug("Begin Loop: managing old broks (%d)", len(self.broks))
 
         # Dump modules Queues size
-        external_modules = [
-            external_module for external_module in self.modules_manager.instances
-            if external_module.is_external
-        ]
-        for external_module in external_modules:
+        insts = [inst for inst in self.modules_manager.instances if inst.is_external]
+        for inst in insts:
             try:
-                logger.debug("[Broks] External Queue len (%s): %s" % (
-                    external_module.get_name(), external_module.to_q.qsize()
-                ))
-            except Exception as exp:
-                logger.debug("External Queue len (%s): Exception! %s" % (external_module.get_name(), exp))
+                logger.debug("External Queue len (%s): %s", inst.get_name(), inst.to_q.qsize())
+            except Exception, exp:
+                logger.debug("External Queue len (%s): Exception! %s", inst.get_name(), exp)
 
         # Begin to clean modules
         self.check_and_del_zombie_modules()
@@ -711,7 +708,8 @@ class Broker(BaseSatellite):
         # Maybe the arbiter ask us to wait for a new conf
         # If true, we must restart all...
         if self.cur_conf is None:
-            # Clean previous run from useless objects and close modules
+            # Clean previous run from useless objects
+            # and close modules
             self.clean_previous_run()
 
             self.wait_for_initial_conf()
@@ -726,13 +724,10 @@ class Broker(BaseSatellite):
         # When it pushes conf to us, we reinit connections
         self.watch_for_new_conf(0.0)
         if self.new_conf:
-            if self.graceful_enabled and self.switch_process() is True:
-                # Child successfully spawned, we're exiting
-                return
             self.setup_new_conf()
 
-        # Maybe the last loop we raised some broks internally we should
-        # integrate them in broks
+        # Maybe the last loop we raised some broks internally
+        # we should integrate them in broks
         self.interger_internal_broks()
         # Also reap broks sent from the arbiters
         self.interger_arbiter_broks()
@@ -746,57 +741,54 @@ class Broker(BaseSatellite):
             statsmgr.timing('core.broker.get-new-broks.%s' % _type, time.time() - _t,
                             'perf')
 
-        # We will works this turn with a copy of the broks, so we won't be
-        # impacted by possible other threads (modules or so)
-        with self.broks_lock:
-            broks = copy.copy(self.broks)
-            to_send = list(self.external_module_broks)
-            self.broks = deque()
-            self.external_module_broks = deque()
+        # Sort the brok list by id
+        self.broks.sort(sort_by_ids)
 
         # and for external queues
         # REF: doc/broker-modules.png (3)
         # We put to external queues broks that was not already send
         t0 = time.time()
         # We are sending broks as a big list, more efficient than one by one
-        queues = self.modules_manager.get_external_to_queues()
+        ext_modules = self.modules_manager.get_external_instances()
+        to_send = [b for b in self.broks if getattr(b, 'need_send_to_ext', True)]
 
-        for q in queues:
+        # Send our pack to all external modules to_q queue so they can get the wole packet
+        # beware, the sub-process/queue can be die/close, so we put to restart the whole module
+        # instead of killing ourself :)
+        for mod in ext_modules:
             try:
-                q.put(to_send)
-            # we catch but the kill detector on the next loop will detect the
-            # fail module and will manage it
-            except Exception:
-                logger.error(
-                    'FAIL TO PUSH DATA TO EXTERNAL MODULE  this module will '
-                    'be detected and restart.'
-                )
+                mod.to_q.put(to_send)
+            except Exception, exp:
+                # first we must find the modules
+                logger.debug(str(exp.__dict__))
+                logger.warning("The mod %s queue raise an exception: %s, "
+                               "I'm tagging it to restart later",
+                               mod.get_name(), str(exp))
+                logger.warning("Exception type: %s", type(exp))
+                logger.warning("Back trace of this kill: %s", traceback.format_exc())
+                self.modules_manager.set_to_restart(mod)
 
-        statsmgr.timing('core.broker.put-to-external-queue', time.time() - t0, 'perf')
-        logger.debug("[Broks] Time to send [%s] broks to module ([%.3f] secs)" % (len(to_send), time.time() - t0))
+
+        # No more need to send them
+        for b in to_send:
+            b.need_send_to_ext = False
+        statsmgr.timing('core.broker.put-to-external-queue', time.time() - t0,
+                        'perf')
+        logger.debug("Time to send %s broks (%d secs)", len(to_send), time.time() - t0)
+        del to_send  # Release the temporary list reference
+
+        # We must had new broks at the end of the list, so we reverse the list
+        self.broks.reverse()
 
         start = time.time()
-        while len(broks) != 0:
+        while len(self.broks) != 0:
             now = time.time()
-
             # Do not 'manage' more than 1s, we must get new broks
             # every 1s
             if now - start > 1:
-                # so we must remerge our last broks with the main broks to do not
-                # lost them
-                with self.broks_lock:
-                    logger.debug(
-                        'Cannot manage all remaining broks [%d] in a loop '
-                        'turn, push bask this broks in the queue.' % len(broks)
-                    )
-                    self.broks.extendleft(broks)
                 break
 
-            try:
-                b = broks.pop()
-            except IndexError:  # no more broks, maybe a daemon stop, not a problem, catch it
-                break
-
+            b = self.broks.pop()
             # Ok, we can get the brok, and doing something with it
             # REF: doc/broker-modules.png (4-5)
             # We un serialize the brok before consume it
@@ -804,22 +796,59 @@ class Broker(BaseSatellite):
             _t = time.time()
             self.manage_brok(b)
             statsmgr.timing('core.broker.manage-brok', time.time() - _t, 'perf')
+            # Release deserialized brok data immediately to reduce
+            # memory pressure from accumulated unpickled dicts
+            b.data = None
 
-        # Maybe external modules raised 'objects' we should get them
-        nb_object_get = self.get_objects_from_from_queues()
-        logger.debug(
-            '[stats] nb object get control queues of external module [%d]' %
-            nb_object_get
-        )
+            nb_broks = len(self.broks)
+
+            # Ok we manage brok, but we still want to listen to arbiter
+            self.watch_for_new_conf(0.0)
+
+            # if we got new broks here from arbiter, we should break the loop
+            # because such broks will not be managed by the
+            # external modules before this loop (we pop them!)
+            if len(self.broks) != nb_broks:
+                break
+
+        # Maybe external modules raised 'objects'
+        # we should get them
+        self.get_objects_from_from_queues()
+
+        # Maybe we do not have something to do, so we wait a little
+        # TODO: redone the diff management....
+        if len(self.broks) == 0:
+            while self.timeout > 0:
+                begin = time.time()
+                self.watch_for_new_conf(1.0)
+                end = time.time()
+                self.timeout = self.timeout - (end - begin)
+            self.timeout = 1.0
+
+            # print "get new broks watch new conf 1: end", len(self.broks)
+
+        # Gen-0 sweep every turn (fast, ~1ms) to promptly free
+        # circular refs created by brok processing this turn
+        gc.collect(0)
+
+        # Return freed heap pages to OS every turn.  The broker
+        # creates many medium-sized temp buffers (HTTP, base64,
+        # zlib, cPickle) each cycle; trimming immediately after
+        # they are freed prevents interior fragmentation from
+        # locking them in.  Syscall cost is negligible (~µs).
+        _malloc_trim()
+
+        # Full GC to reclaim deeper generation circular references
+        # from unpickled brok objects that Python 2.7 refcount alone
+        # won't free
+        now = time.time()
+        if now - self._last_gc >= self._gc_interval:
+            gc.collect()
+            _malloc_trim()
+            self._last_gc = now
 
         # Say to modules it's a new tick :)
         self.hook_point('tick')
-
-        logger.debug('[stats] broks done this loop %d/%d' % (self.broks_done, nb_broks))
-
-        time.sleep(max(0.01, min(1.0, 1.0 - (time.time() - loop_time))))
-        # Checks if memory consumption did not exceed allowed thresold
-        self.check_memory_usage()
 
 
     #  Main function, will loop forever
@@ -840,7 +869,6 @@ class Broker(BaseSatellite):
 
             # Look if we are enabled or not. If ok, start the daemon mode
             self.look_for_early_exit()
-            self.load_parent_config()
             self.do_daemon_init_and_start()
             self.load_modules_manager()
 
@@ -855,6 +883,7 @@ class Broker(BaseSatellite):
                 return
 
             self.setup_new_conf()
+
 
             # Do the modules part, we have our modules in self.modules
             # REF: doc/broker-modules.png (1)
